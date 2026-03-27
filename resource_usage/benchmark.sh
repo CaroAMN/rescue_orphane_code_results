@@ -9,7 +9,7 @@
 # Each replicate consists of:
 #   MATLAB : 3 sequential process calls (intensity, align, stitch)
 #            monitored via matlab_monitor.sh
-#   Nextflow: 1 full pipeline run (all 3 processes)
+#   Nextflow: 1 full pipeline run (all 4 processes)
 #            monitored via native Nextflow trace
 #
 # Output structure:
@@ -32,16 +32,21 @@
 
 # --- Configuration -----------------------------------------------------------
 N_REPLICATES=30
-BASE_OUTDIR="./benchmark_results"
+BASE_OUTDIR="/mnt/ssd/performance_benchmark"
 
 # MATLAB
-MONITOR_SCRIPT="./matlab_monitor.sh"
+MONITOR_SCRIPT="./monitoring_script.sh"
 
 # Nextflow
 NF_INPUT="/home/schwitalla/Documents/sample_sheettest_local.csv"
-NF_PIPELINE="lsmquant"
-NF_PROFILE="docker"
-NF_STAGE="int-align-stitch"
+NF_PIPELINE="/home/schwitalla/Documents/lsmquant"
+NF_PROFILE="docker,gpu"
+NF_STAGE="int_align_stitch"
+NF_CONFIG="/home/schwitalla/Documents/rescue_orphane_code_results/resource_usage/benchmark.config"
+NF_MODEL="/home/schwitalla/Documents/Original_Numorph/numorph_dev/src/analysis/3dunet/nuclei/models/075_121_model.h5"
+
+RESUME=0
+
 
 # --- Logging -----------------------------------------------------------------
 LOG_FILE=""   # set after BASE_OUTDIR is created below
@@ -56,6 +61,28 @@ log_separator() {
     local line="$(printf '=%.0s' {1..60})"
     echo "$line"
     echo "$line" >> "$LOG_FILE"
+}
+
+is_matlab_complete() {
+    local rep_idx=$1
+    local outdir="$BASE_OUTDIR/matlab/replicate_${rep_idx}"
+    for proc in intensity align stitch count; do
+        if [ ! -f "$outdir/process_${proc}/matlab_trace.log" ]; then
+            return 1
+        fi
+    done
+    return 0
+}
+ 
+is_nextflow_complete() {
+    local rep_idx=$1
+    local outdir="$BASE_OUTDIR/nextflow/replicate_${rep_idx}"
+    # multiqc is the last process to complete — if it exists the full
+    # pipeline ran successfully. More reliable than a sentinel file.
+    if [ -d "$outdir/multiqc" ]; then
+        return 0
+    fi
+    return 1
 }
 
 # --- Preflight checks --------------------------------------------------------
@@ -119,12 +146,13 @@ run_matlab_replicate() {
     log "--- MATLAB replicate ${rep_idx} START ---"
     log "Output dir: $outdir"
 
-    # Run all 3 processes sequentially, each in its own monitored subdirectory
-    local processes=("intensity" "align" "stitch")
+    # Run all 4 processes sequentially, each in its own monitored subdirectory
+    local processes=("intensity" "align" "stitch" "count")
     local commands=(
         "NM_config('intensity','sample${rep_idx}',true)"
         "NM_config('align','sample${rep_idx}',true)"
         "NM_config('stitch','sample${rep_idx}',true)"
+        "NM_config('count','sample${rep_idx}',true)"
     )
 
     for i in "${!processes[@]}"; do
@@ -166,10 +194,13 @@ run_nextflow_replicate() {
 
     nextflow run "$NF_PIPELINE" \
         -profile "$NF_PROFILE" \
+        -c "$NF_CONFIG" \
         --input "$NF_INPUT" \
         --outdir "$outdir" \
         -work-dir "$workdir" \
-        --stage "$NF_STAGE"
+        --stage "$NF_STAGE" \
+        --nuclei_quantification \
+        --model_file "$NF_MODEL"
 
     local exit_code=$?
     if [ $exit_code -ne 0 ]; then
@@ -198,74 +229,111 @@ update_progress() {
 
 # --- Main --------------------------------------------------------------------
 main() {
-    # Parse optional arguments
+    echo $CONDA_PREFIX
+    echo $PATH | tr ':' '\n' | grep conda
+ 
+    ### NEW: detect --resume before getopts ###
+    for arg in "$@"; do
+        if [ "$arg" = "--resume" ]; then
+            RESUME=1
+        fi
+    done
+    ### END NEW ###
+ 
     while getopts "n:o:h" opt; do
         case $opt in
             n) N_REPLICATES="$OPTARG" ;;
             o) BASE_OUTDIR="$OPTARG"  ;;
             h)
-                echo "Usage: $0 [-n replicates] [-o output_dir]"
-                echo "  -n  Number of replicates (default: 30)"
-                echo "  -o  Base output directory (default: ./benchmark_results)"
+                echo "Usage: $0 [-n replicates] [-o output_dir] [--resume]"
+                echo "  -n        Number of replicates (default: 30)"
+                echo "  -o        Base output directory"
+                echo "  --resume  Resume a previously interrupted run"
                 exit 0
                 ;;
         esac
     done
-
-    # Set up output directories and logging
+ 
     mkdir -p "$BASE_OUTDIR/matlab"
     mkdir -p "$BASE_OUTDIR/nextflow"
     LOG_FILE="$BASE_OUTDIR/benchmark_run.log"
     touch "$LOG_FILE"
-
+ 
     log_separator
     log "Benchmark run started"
     log "N replicates:   $N_REPLICATES"
     log "Base output:    $BASE_OUTDIR"
     log "Nextflow input: $NF_INPUT"
+    [ $RESUME -eq 1 ] && log "Mode: RESUME" || log "Mode: FRESH START"  ### NEW ###
     log_separator
-
-    # Preflight
+ 
     preflight_checks
-
-    # Generate and save randomised run order
+ 
+    ### NEW: load existing order on resume, generate fresh order otherwise ###
     local run_order_file="$BASE_OUTDIR/run_order.txt"
     local run_order=()
-    while IFS= read -r token; do
-        run_order+=("$token")
-    done < <(generate_run_order "$N_REPLICATES")
-
-    printf '%s\n' "${run_order[@]}" > "$run_order_file"
-    log "Randomised run order saved to: $run_order_file"
+ 
+    if [ $RESUME -eq 1 ] && [ -f "$run_order_file" ]; then
+        while IFS= read -r token; do
+            run_order+=("$token")
+        done < "$run_order_file"
+        log "RESUME: Reloaded run order from $run_order_file"
+    else
+        if [ $RESUME -eq 1 ]; then
+            log "WARNING: --resume set but no run_order.txt found — starting fresh"
+        fi
+        while IFS= read -r token; do
+            run_order+=("$token")
+        done < <(generate_run_order "$N_REPLICATES")
+        printf '%s\n' "${run_order[@]}" > "$run_order_file"
+        log "Randomised run order saved to: $run_order_file"
+    fi
+ 
     log "Total runs to execute: ${#run_order[@]}"
     log_separator
-
-    # Execute in randomised order
+ 
     local completed=0
+    local skipped=0
     local total=${#run_order[@]}
-
+ 
     for token in "${run_order[@]}"; do
-        local tool="${token%_*}"        # "matlab" or "nextflow"
-        local rep_idx="${token#*_}"     # "01", "02", etc.
-
+        local tool="${token%_*}"
+        local rep_idx="${token#*_}"
+ 
+        # skip completed replicates in resume mode 
+        if [ $RESUME -eq 1 ]; then
+            if [ "$tool" = "matlab" ] && is_matlab_complete "$rep_idx"; then
+                log "SKIP (already complete): $token"
+                skipped=$((skipped + 1))
+                completed=$((completed + 1))
+                continue
+            elif [ "$tool" = "nextflow" ] && is_nextflow_complete "$rep_idx"; then
+                log "SKIP (already complete): $token"
+                skipped=$((skipped + 1))
+                completed=$((completed + 1))
+                continue
+            fi
+        fi
+ 
         log_separator
         log "Run $((completed + 1)) / $total : $token"
         log_separator
-
+ 
         if [ "$tool" = "matlab" ]; then
             run_matlab_replicate "$rep_idx"
         elif [ "$tool" = "nextflow" ]; then
             run_nextflow_replicate "$rep_idx"
         fi
-
+ 
         completed=$((completed + 1))
         update_progress "$completed" "$total" "$token"
         log "Completed $completed / $total runs"
     done
-
+ 
     log_separator
     log "Benchmark run complete."
     log "Total runs completed: $completed / $total"
+    [ $skipped -gt 0 ] && log "Skipped (already complete): $skipped"  ### NEW ###
     log "Results in: $BASE_OUTDIR"
     log_separator
 }
