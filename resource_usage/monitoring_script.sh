@@ -247,10 +247,17 @@ monitor_matlab() {
     local start_millis=$(nxf_date)
 
     # --- Launch MATLAB in the background -------------------------------------
-    echo "Starting MATLAB: $MATLAB_PATH -nodesktop -nodisplay -nosplash -batch \"run('$matlab_script')\""
+    echo "Starting MATLAB: $MATLAB_PATH -nodesktop -nodisplay -nosplash -batch \"NM_config('intensity','test_monitor',true)\""
     echo "Output directory: $output_dir"
 
-    $MATLAB_PATH -nodesktop -nodisplay -nosplash -batch "run('$matlab_script')" &
+    local matlab_expr
+    if [ -n "$MATLAB_COMMAND" ]; then
+        matlab_expr="$MATLAB_COMMAND"
+    else
+        matlab_expr="run('$matlab_script')"
+    fi
+    
+    $MATLAB_PATH -nodesktop -nodisplay -nosplash -batch "$matlab_expr" &
     local task=$!
     echo "MATLAB PID: $task"
 
@@ -357,9 +364,10 @@ usage() {
 }
 
 # --- Argument parsing --------------------------------------------------------
-while getopts "s:o:dh" opt; do
+while getopts "s:c:o:dh" opt; do
     case $opt in
         s) MATLAB_SCRIPT="$OPTARG" ;;
+        c) MATLAB_COMMAND="$OPTARG"   ;;
         o) OUTPUT_DIR="$OPTARG"    ;;
         d) NXF_DEBUG=1             ;;
         h) usage                   ;;
